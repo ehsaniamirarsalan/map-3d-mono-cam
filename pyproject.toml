@@ -1,0 +1,27 @@
+[project]
+name = "mapdet3d"
+version = "0.1.0"
+description = "Reimplementation of Map-Det3D: Metric Feed-Forward 3D Reconstruction Prior for Multi-view 3D Object Detection from Streaming Inputs"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy",
+    "scipy",
+    "pyyaml",
+    "einops",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+# Needed for the real MapAnything backbone (third_party/map-anything) and
+# the real CA-1M loader (third_party/ml-cubifyanything). Not required for
+# the synthetic-data pipeline (tools/train.py, tools/eval.py).
+real-data = ["tifffile", "webdataset==0.2.86", "pip-system-certs"]
+
+[tool.setuptools.packages.find]
+include = ["mapdet3d*"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

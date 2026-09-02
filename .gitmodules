@@ -1,0 +1,6 @@
+[submodule "third_party/map-anything"]
+	path = third_party/map-anything
+	url = https://github.com/facebookresearch/map-anything
+[submodule "third_party/ml-cubifyanything"]
+	path = third_party/ml-cubifyanything
+	url = https://github.com/apple/ml-cubifyanything
