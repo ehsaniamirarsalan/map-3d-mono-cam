@@ -10,6 +10,7 @@ Box3DHead to each (query_k, ref_boxes_k) pair returned here.
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor, nn
 
 from mapdet3d.detector.anchor_generator import generate_anchors
@@ -69,7 +70,7 @@ class DetrDetector(nn.Module):
         )
 
         proposal_logits, proposal_boxes = self.proposal_head(tokens, anchors)
-        query_feats, ref_boxes0, _ = select_top_m(tokens, proposal_logits, proposal_boxes, self.num_queries)
+        query_feats, ref_boxes0, indices = select_top_m(tokens, proposal_logits, proposal_boxes, self.num_queries)
         query0 = self.query_proj(query_feats)
 
         layer_outputs = self.decoder(query0, ref_boxes0, tokens, spatial_shapes)
@@ -77,5 +78,7 @@ class DetrDetector(nn.Module):
         return {
             "proposal_logits": proposal_logits,
             "proposal_boxes": proposal_boxes,
+            "selected_logits": torch.gather(proposal_logits, 1, indices[..., None]),
+            "selected_boxes": torch.gather(proposal_boxes, 1, indices[..., None].expand(-1, -1, 4)),
             "layer_outputs": layer_outputs,
         }

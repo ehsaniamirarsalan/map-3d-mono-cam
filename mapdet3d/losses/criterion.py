@@ -36,6 +36,8 @@ def layer_loss(
 ) -> dict[str, Tensor]:
     """Compute one decoder layer's (2D + 3D) losses, averaged over matched boxes."""
     bs, num_queries = pred["logits"].shape[:2]
+    if len(targets) != bs:
+        raise ValueError(f"Expected {bs} per-view targets, received {len(targets)}")
     device = pred["logits"].device
 
     target_boxes2d = [t["boxes2d"] for t in targets]
@@ -118,7 +120,12 @@ class SetCriterion(nn.Module):
         self.weight_giou = cost_giou
         self.weight_3d = weight_3d
 
-    def forward(self, layer_preds: list[LayerPred], targets: list[Target]) -> dict[str, Tensor]:
+    def forward(self, outputs: dict | list[LayerPred], targets: list[Target]) -> dict[str, Tensor]:
+        # The encoder stage in layer_preds[0] uses connected proposal outputs.
+        # Lists remain accepted for callers computing isolated layer losses.
+        layer_preds = outputs["layer_preds"] if isinstance(outputs, dict) else outputs
+        if not layer_preds:
+            raise ValueError("At least one supervised stage is required")
         per_layer = [
             layer_loss(
                 pred,

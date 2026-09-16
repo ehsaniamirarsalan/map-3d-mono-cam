@@ -31,7 +31,8 @@ class _TwoLayerMLP(nn.Module):
 class Box3DHead(nn.Module):
     def __init__(self, in_dim: int = 256, hidden_dim: int = 256):
         super().__init__()
-        self.center_mlp = _TwoLayerMLP(in_dim, hidden_dim, 3)  # x~, y~, log-depth d~
+        self.center_mlp = _TwoLayerMLP(in_dim, hidden_dim, 2)
+        self.depth_mlp = _TwoLayerMLP(in_dim, hidden_dim, 1)
         self.dim_mlp = _TwoLayerMLP(in_dim, hidden_dim, 3)  # log-sizes s~w, s~l, s~h
         self.rot_mlp = _TwoLayerMLP(in_dim, hidden_dim, 6)  # allocentric 6D rotation
         self.conf_mlp = nn.Linear(in_dim, 1)  # binary objectness logit
@@ -56,7 +57,7 @@ class Box3DHead(nn.Module):
 
         raw_center = self.center_mlp(query)  # (..., 3): x~, y~, log-depth
         xy_tilde = raw_center[..., :2]
-        log_depth = raw_center[..., 2:3]
+        log_depth = self.depth_mlp(query)
         xy = rho * xy_tilde
         z = rho * torch.exp(log_depth)
         center = torch.cat([xy, z], dim=-1)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+from mapdet3d.detector.box_ops import inverse_sigmoid
 
 
 class ProposalHead(nn.Module):
@@ -32,7 +33,7 @@ class ProposalHead(nn.Module):
         """
         logits = self.class_head(tokens)
         deltas = self.bbox_head(tokens)
-        boxes = (anchors.unsqueeze(0) + deltas).clamp(0.0, 1.0)
+        boxes = (inverse_sigmoid(anchors.unsqueeze(0)) + deltas).sigmoid()
         return logits, boxes
 
 
@@ -57,6 +58,8 @@ def select_top_m(
         ref_boxes: (N, M, 4), detached.
         topk_idx: (N, M) indices into the anchor dimension.
     """
+    if not 0 < num_queries <= tokens.shape[1]:
+        raise ValueError("num_queries must be positive and no larger than the number of feature positions")
     scores = logits.squeeze(-1)
     topk_idx = scores.topk(num_queries, dim=1).indices
     query_feats = torch.gather(tokens, 1, topk_idx.unsqueeze(-1).expand(-1, -1, tokens.shape[-1]))

@@ -94,7 +94,13 @@ class MSDeformAttn(nn.Module):
         self.output_proj = nn.Linear(d_model, d_model)
 
         nn.init.constant_(self.sampling_offsets.weight, 0.0)
-        nn.init.constant_(self.sampling_offsets.bias, 0.0)
+        angles = torch.arange(n_heads) * (2 * torch.pi / n_heads)
+        radial = torch.stack([angles.cos(), angles.sin()], -1)
+        radial = radial / radial.abs().amax(-1, keepdim=True)
+        radial = radial[:, None, None, :].repeat(1, n_levels, n_points, 1)
+        radial *= torch.arange(1, n_points + 1)[None, None, :, None]
+        with torch.no_grad():
+            self.sampling_offsets.bias.copy_(radial.flatten())
         nn.init.constant_(self.attention_weights.weight, 0.0)
         nn.init.constant_(self.attention_weights.bias, 0.0)
 
@@ -139,10 +145,19 @@ class MSDeformAttn(nn.Module):
             [[w, h] for h, w in spatial_shapes], device=query.device, dtype=query.dtype
         )  # (n_levels, 2), (x, y) order to match (w, h) normalization.
 
-        sampling_locations = (
-            reference_points[:, :, None, None, None, :]
-            + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
-        )
+        if reference_points.shape[-1] == 4:
+            sampling_locations = (
+                reference_points[:, :, None, None, None, :2]
+                + sampling_offsets / self.n_points
+                * reference_points[:, :, None, None, None, 2:] * 0.5
+            )
+        elif reference_points.shape[-1] == 2:
+            sampling_locations = (
+                reference_points[:, :, None, None, None, :]
+                + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+            )
+        else:
+            raise ValueError("Reference points must have two or four coordinates")
 
         output = multi_scale_deformable_attention(value, spatial_shapes, sampling_locations, attention_weights)
         return self.output_proj(output)

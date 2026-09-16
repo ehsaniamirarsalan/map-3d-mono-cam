@@ -13,6 +13,7 @@ from __future__ import annotations
 from torch import Tensor, nn
 
 from mapdet3d.detector.ms_deform_attn import MSDeformAttn
+from mapdet3d.detector.box_ops import inverse_sigmoid
 
 
 class DeformableDecoderLayer(nn.Module):
@@ -36,6 +37,7 @@ class DeformableDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
+        self.query_position = nn.Sequential(nn.Linear(4, d_model), nn.ReLU(), nn.Linear(d_model, d_model))
         self.bbox_refine = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(inplace=True),
@@ -64,17 +66,16 @@ class DeformableDecoderLayer(nn.Module):
             updated_query: (N, M, d_model).
             updated_ref_boxes: (N, M, 4), refined and clamped to [0, 1].
         """
-        attn_out, _ = self.self_attn(query, query, query)
-        query = self.norm1(query + attn_out)
-
-        ref_points = ref_boxes[..., :2]
-        cross_out = self.cross_attn(query, ref_points, value_input, spatial_shapes)
-        query = self.norm2(query + cross_out)
+        position = self.query_position(inverse_sigmoid(ref_boxes))
+        cross_out = self.cross_attn(query + position, ref_boxes, value_input, spatial_shapes)
+        query = self.norm1(query + cross_out)
+        attn_out, _ = self.self_attn(query + position, query + position, query, need_weights=False)
+        query = self.norm2(query + attn_out)
 
         ffn_out = self.ffn(query)
         query = self.norm3(query + ffn_out)
 
         delta = self.bbox_refine(query)
-        updated_ref_boxes = (ref_boxes + delta).clamp(0.0, 1.0)
+        updated_ref_boxes = (inverse_sigmoid(ref_boxes) + delta).sigmoid()
 
         return query, updated_ref_boxes

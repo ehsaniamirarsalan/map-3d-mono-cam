@@ -38,7 +38,7 @@ def synthetic_batch_step(
     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
     out = model(features, rho)
-    return criterion(out["layer_preds"], targets)
+    return criterion(out, targets)
 
 
 def views_batch_step(
@@ -52,7 +52,7 @@ def views_batch_step(
     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
     out = model(views)
-    return criterion(out["layer_preds"], targets)
+    return criterion(out, targets)
 
 
 def train_one_epoch(

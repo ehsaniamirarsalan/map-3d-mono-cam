@@ -66,13 +66,13 @@ class MapDet3DCore(nn.Module):
         det_out = self.detector(features)
 
         layer_preds = []
-        for head, (query_k, ref_boxes_k) in zip(self.box3d_heads, det_out["layer_outputs"]):
+        for k, (head, (query_k, ref_boxes_k)) in enumerate(zip(self.box3d_heads, det_out["layer_outputs"])):
             rho_per_box = rho.view(-1, 1).expand(-1, query_k.shape[1])
             box3d_out = head(query_k, rho_per_box)
             layer_preds.append(
                 {
-                    "logits": box3d_out["conf"],
-                    "boxes2d": ref_boxes_k,
+                    "logits": det_out["selected_logits"] if k == 0 else box3d_out["conf"],
+                    "boxes2d": det_out["selected_boxes"] if k == 0 else ref_boxes_k,
                     "center": box3d_out["center"],
                     "dims": box3d_out["dims"],
                     "rot": box3d_out["rot"],

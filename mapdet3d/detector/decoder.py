@@ -60,4 +60,5 @@ class DeformableDecoder(nn.Module):
         for layer in self.layers:
             query, ref_boxes = layer(query, ref_boxes, value_input, spatial_shapes)
             outputs.append((query, ref_boxes))
+            ref_boxes = ref_boxes.detach()
         return outputs
