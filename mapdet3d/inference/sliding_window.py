@@ -13,12 +13,16 @@ from mapdet3d.models.mapdet3d import MapDet3D
 
 class SlidingWindowInference:
     def __init__(self, model: MapDet3D, window_size: int):
+        if window_size < 1:
+            raise ValueError("window_size must be positive")
+        self.scene_id = None
         self.model = model
         self.window_size = window_size
         self.buffer: list[dict] = []
 
     def reset(self) -> None:
         self.buffer = []
+        self.scene_id = None
 
     @torch.no_grad()
     def step(self, view: dict) -> dict[str, Tensor]:
@@ -31,7 +35,14 @@ class SlidingWindowInference:
             The final-layer predictions (LayerPred dict: "logits", "boxes2d",
             "center", "dims", "rot") for the CURRENT frame only.
         """
-        self.buffer.append(view)
+        scene = view.get('scene_id')
+        if scene != self.scene_id:
+            self.reset()
+            self.scene_id = scene
+        if self.buffer and 'timestamp' in view and 'timestamp' in self.buffer[-1]:
+            if view['timestamp'] <= self.buffer[-1]['timestamp']:
+                raise ValueError('Streaming timestamps must increase within a scene')
+        self.buffer.append(dict(view))
         if len(self.buffer) > self.window_size:
             self.buffer = self.buffer[-self.window_size :]
 

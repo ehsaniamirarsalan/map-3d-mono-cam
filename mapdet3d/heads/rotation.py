@@ -24,9 +24,15 @@ def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
         (..., 3, 3) proper rotation matrices (right-handed, orthonormal).
     """
     a1, a2 = d6[..., :3], d6[..., 3:]
-    b1 = F.normalize(a1, dim=-1)
+    fallback_x = torch.zeros_like(a1)
+    fallback_x[..., 0] = 1
+    b1 = torch.where(a1.norm(dim=-1, keepdim=True) > 1e-6,
+                     F.normalize(a1, dim=-1), fallback_x)
     b2 = a2 - (b1 * a2).sum(-1, keepdim=True) * b1
-    b2 = F.normalize(b2, dim=-1)
+    least_aligned = F.one_hot(b1.abs().argmin(-1), num_classes=3).to(b1)
+    fallback_y = F.normalize(least_aligned - (least_aligned*b1).sum(-1,keepdim=True)*b1, dim=-1)
+    b2 = torch.where(b2.norm(dim=-1,keepdim=True) > 1e-6,
+                     F.normalize(b2, dim=-1), fallback_y)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack((b1, b2, b3), dim=-1)
 

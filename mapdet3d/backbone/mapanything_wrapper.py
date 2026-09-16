@@ -1,95 +1,86 @@
-"""Wraps MapAnything to expose the paper's multi-scale features {F_E, F_7,
-F_11, F_15} and metric scale factor rho, none of which MapAnything's public
-`forward()`/`infer()` return (they only return final decoded outputs like
-points, poses, and the metric scaling factor per view).
+"""Differentiable detection adapter for the pinned MapAnything implementation.
 
-Confirmed by direct inspection of the vendored `third_party/map-anything`
-source (pinned commit) and the `uniception` package it depends on:
-
-- `self.model.encoder` is called once with all views concatenated along the
-  batch dimension and returns a `ViTEncoderOutput` with `.features`
-  (batch*num_views, C, H, W); MapAnything itself splits this via
-  `.chunk(num_views, dim=0)` into the paper's F_E (one tensor per view)
-  (`mapanything/models/mapanything/model.py::_encode_n_views`).
-- `self.model.info_sharing` is the 16-layer
-  `MultiViewAlternatingAttentionTransformerIFR`, configured with
-  `indices=[7, 11]`. Its forward returns
-  `(final_output, intermediate_outputs)`, both `MultiViewTransformerOutput`
-  dataclasses with `.features` (list of per-view tensors) and
-  `.additional_token_features` (the scale token's transformer-updated
-  hidden state, i.e. the paper's pre-scale-head rho input).
-  `intermediate_outputs[0].features` == F_7, `intermediate_outputs[1].features`
-  == F_11, `final_output.features` == F_15.
-
-Rather than duplicating MapAnything's large `forward()` method, we register
-forward hooks on these two submodules and capture their return values
-directly during a normal `self.model.forward(views)` call.
+Only frozen encoding, multi-view fusion and scale decoding are executed. Dense
+reconstruction heads are neither trained nor evaluated by this adapter.
 """
-
 from __future__ import annotations
 
+from types import SimpleNamespace
 import torch
-from torch import Tensor, nn
+from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class MapAnythingBackbone(nn.Module):
-    def __init__(
-        self,
-        pretrained: str = "facebook/map-anything-apache",
-        freeze_encoder: bool = True,
-    ):
+    def __init__(self, pretrained="facebook/map-anything", freeze_encoder=True,
+                 model=None, activation_checkpointing=False):
         super().__init__()
-        from mapanything.models import MapAnything  # heavy optional dependency
+        if not freeze_encoder:
+            raise ValueError("The paper preset requires frozen multimodal encoders")
+        if model is None:
+            try:
+                from mapanything.models import MapAnything
+            except ImportError as exc:
+                raise ImportError("Install the pinned backbone: uv pip install -e third_party/map-anything") from exc
+            model = MapAnything.from_pretrained(pretrained)
+        self.model = model
+        self.pretrained = pretrained
+        self.activation_checkpointing = activation_checkpointing
+        self.in_dims = dict(F_E=model.encoder.enc_embed_dim,
+                            **{k: model.info_sharing.dim for k in ('F_7', 'F_11', 'F_15')})
+        self.patch_size = int(model.encoder.patch_size)
+        self.norm_type = model.encoder.data_norm_type
+        self.model.requires_grad_(False)
+        for name in ("info_sharing", "scale_head", "scale_adaptor", "scale_token"):
+            getattr(self.model, name).requires_grad_(True)
+        # MapAnything samples modality masks even in eval mode. Conditioning is
+        # deterministic here; modality presence is controlled by the caller.
+        if hasattr(model, "geometric_input_config"):
+            model.geometric_input_config = dict(model.geometric_input_config)
+            model.geometric_input_config.update(overall_prob=1.0, dropout_prob=0.0,
+                                                ray_dirs_prob=1.0, cam_prob=1.0,
+                                                depth_prob=0.0, depth_scale_norm_all_prob=0.0)
+        self.train(self.training)
 
-        self.model = MapAnything.from_pretrained(pretrained)
-        self._captured: dict = {}
-        self.model.encoder.register_forward_hook(self._capture("encoder_output"))
-        self.model.info_sharing.register_forward_hook(self._capture("info_sharing_output"))
+    def train(self, mode=True):
+        super().train(mode)
+        self.model.eval()
+        for name in ("info_sharing", "scale_head", "scale_adaptor"):
+            getattr(self.model, name).train(mode)
+        return self
 
-        if freeze_encoder:
-            for p in self.model.encoder.parameters():
-                p.requires_grad_(False)
+    def forward(self, views):
+        from mapanything.utils.inference import preprocess_input_views_for_inference
+        if not views:
+            raise ValueError("At least one view is required")
+        shape = views[0]['img'].shape
+        if len(shape) != 4 or any(v['img'].shape != shape for v in views):
+            raise ValueError("All views must share (B, C, H, W)")
+        if any('camera_poses' in v for v in views) and 'camera_poses' not in views[0]:
+            raise ValueError("Pose conditioning requires a pose for the first view")
+        views = preprocess_input_views_for_inference(views)
+        with torch.no_grad():
+            features, registers = self.model._encode_n_views(views)
+            with torch.autocast(device_type=views[0]['img'].device.type, enabled=False):
+                features = self.model._encode_and_fuse_optional_geometric_inputs(
+                    views, [f.float() for f in features])
+        token = self.model.scale_token[None, :, None].expand(shape[0], -1, -1)
 
-    def _capture(self, key: str):
-        def _hook(module, inputs, output):
-            self._captured[key] = output
+        def fuse(*inputs):
+            out, intermediate = self.model.info_sharing(SimpleNamespace(
+                features=list(inputs[:-1]), additional_input_tokens_per_view=registers,
+                additional_input_tokens=inputs[-1]))
+            if len(intermediate) != 2:
+                raise ValueError("Backbone must expose transformer layers 7 and 11")
+            return (*intermediate[0].features, *intermediate[1].features,
+                    *out.features, out.additional_token_features)
 
-        return _hook
-
-    def forward(self, views: list[dict]) -> dict[str, Tensor | list[Tensor]]:
-        """
-        Args:
-            views: list of T per-view dicts in MapAnything's `forward()` input
-                format (each with "img" and "data_norm_type", optionally
-                "ray_directions_cam", "camera_pose_quats"/"camera_pose_trans" —
-                see `mapanything/utils/inference.py` for the full contract).
-
-        Returns:
-            dict with:
-              "F_E":  List[T] of (B, C_enc, H, W) — raw per-view encoder features.
-              "F_7":  List[T] of (B, C, H, W) — layer-7 multi-view transformer features.
-              "F_11": List[T] of (B, C, H, W) — layer-11 multi-view transformer features.
-              "F_15": List[T] of (B, C, H, W) — final (layer-16) transformer features.
-              "rho":  (B,) metric scale factor, from MapAnything's own scale head.
-              "scale_token_features": (B, C, 1) pre-head scale token hidden state.
-        """
-        self._captured.clear()
-        num_views = len(views)
-        per_view_outputs = self.model.forward(views)
-
-        encoder_output = self._captured["encoder_output"]
-        f_e = list(encoder_output.features.chunk(num_views, dim=0))
-
-        final_output, intermediate_outputs = self._captured["info_sharing_output"]
-
-        return {
-            "F_E": f_e,
-            "F_7": intermediate_outputs[0].features,
-            "F_11": intermediate_outputs[1].features,
-            "F_15": final_output.features,
-            # Real MapAnything returns this as (B, 1); flatten to (B,) to
-            # match this wrapper's documented contract and the rest of the
-            # pipeline (mapdet3d.models.mapdet3d.MapDet3D expects (B,)).
-            "rho": per_view_outputs[0]["metric_scaling_factor"].reshape(-1),
-            "scale_token_features": final_output.additional_token_features,
-        }
+        args = (*features, token)
+        flat = checkpoint(fuse, *args, use_reentrant=False) if self.training and self.activation_checkpointing else fuse(*args)
+        n = len(views)
+        with torch.autocast(device_type=views[0]['img'].device.type, enabled=False):
+            decoded = self.model.scale_head(SimpleNamespace(last_feature=flat[-1].float()))
+            scale = self.model.scale_adaptor(SimpleNamespace(
+                adaptor_feature=decoded.decoded_channels, output_shape_hw=shape[-2:])).value
+        return dict(F_E=list(features), F_7=list(flat[:n]), F_11=list(flat[n:2*n]),
+                    F_15=list(flat[2*n:3*n]), rho=scale.reshape(shape[0]), scale_token_features=flat[-1])

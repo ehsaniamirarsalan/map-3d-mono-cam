@@ -90,27 +90,23 @@ def test_instances_to_target_handles_empty_frame():
     assert target["center"].shape == (0, 3)
 
 
-def test_sliding_window_emits_correct_window_size(monkeypatch):
-    frames = [_make_fake_frame(video_id=1, num_boxes=1) for _ in range(20)]
+def test_windows_are_chronological_and_scene_isolated(monkeypatch):
+    from tests.fixtures import raw_view, target
+    frames=[dict(view=raw_view(i,scene),target=target()) for scene in ('a','b') for i in range(20)]
+    ds=CA1MWindowDataset('unused',window_size=5)
+    monkeypatch.setattr(ds,'iter_frames',lambda:iter(frames))
+    windows=list(ds)
+    assert len(windows)==40
+    assert len(windows[20]['history'])==1
+    for sample in windows:
+        assert len({f['view']['scene_id'] for f in sample['history']})==1
+        stamps=[f['view']['timestamp'] for f in sample['history']]
+        assert stamps==sorted(set(stamps))
 
-    ds = CA1MWindowDataset(source="unused", window_size=5, stride_range=(1, 1))
-    monkeypatch.setattr(ds, "_underlying", lambda: iter(frames))
 
-    samples = list(ds)
-    assert len(samples) == 20 - 5 + 1  # first window emitted once buffer reaches window_size
-    for sample in samples:
-        assert len(sample["views"]) == 5
-        assert "target" in sample
-        assert sample["target"]["center"].shape[0] == 1
-
-
-def test_sliding_window_keeps_videos_separate(monkeypatch):
-    frames_v1 = [_make_fake_frame(video_id=1, num_boxes=1) for _ in range(6)]
-    frames_v2 = [_make_fake_frame(video_id=2, num_boxes=1) for _ in range(6)]
-    interleaved = [f for pair in zip(frames_v1, frames_v2) for f in pair]
-
-    ds = CA1MWindowDataset(source="unused", window_size=3, stride_range=(1, 1))
-    monkeypatch.setattr(ds, "_underlying", lambda: iter(interleaved))
-
-    samples = list(ds)
-    assert len(samples) > 0  # windows form independently per video despite interleaving
+def test_timestamp_sampling_uses_seconds():
+    from tests.fixtures import raw_view, target
+    from mapdet3d.data.ca1m.collate import select_history
+    history=[dict(view=raw_view(i),target=target()) for i in range(21)]
+    chosen=select_history(history,5,2)
+    assert [round(f['view']['timestamp'],2) for f in chosen]==[0.,.5,1.,1.5,2.]

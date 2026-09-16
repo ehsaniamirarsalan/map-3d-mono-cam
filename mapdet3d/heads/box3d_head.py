@@ -35,6 +35,8 @@ class Box3DHead(nn.Module):
         self.depth_mlp = _TwoLayerMLP(in_dim, hidden_dim, 1)
         self.dim_mlp = _TwoLayerMLP(in_dim, hidden_dim, 3)  # log-sizes s~w, s~l, s~h
         self.rot_mlp = _TwoLayerMLP(in_dim, hidden_dim, 6)  # allocentric 6D rotation
+        with torch.no_grad():
+            self.rot_mlp.net[-1].bias.copy_(torch.tensor([1., 0., 0., 0., 1., 0.]))
         self.conf_mlp = nn.Linear(in_dim, 1)  # binary objectness logit
 
     def forward(self, query: Tensor, rho: Tensor) -> dict[str, Tensor]:
@@ -70,7 +72,8 @@ class Box3DHead(nn.Module):
         # Ray direction only depends on the direction of `center`, not its
         # magnitude, so using the metric center here is equivalent to using
         # the up-to-scale center (rho > 0 never flips direction).
-        rot_ego = allocentric_to_egocentric(rot_allo, center)
+        # Keep the rotation corner loss disentangled from the center regressors.
+        rot_ego = allocentric_to_egocentric(rot_allo, center.detach())
 
         conf = self.conf_mlp(query)
 

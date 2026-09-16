@@ -39,7 +39,20 @@ def project_corners_to_2d_box(
     Returns:
         (4,) normalized cxcywh box.
     """
-    z = corners_cam[:, 2].clamp(min=1e-6)
+    # Clip the convex box against a positive near plane before projection.
+    # All corner pairs include the box edges; extra diagonal intersections
+    # lie inside the clipped hull and cannot expand its projected bounds.
+    near = 1e-4
+    points = [corners_cam[corners_cam[:, 2] >= near]]
+    for i in range(len(corners_cam)):
+        for j in range(i):
+            a, b = corners_cam[i], corners_cam[j]
+            if bool((a[2] >= near) != (b[2] >= near)):
+                points.append((a + (b-a) * ((near-a[2])/(b[2]-a[2])))[None])
+    corners_cam = torch.cat(points)
+    if not len(corners_cam):
+        return K.new_zeros(4)  # Retain its 3D annotation; no image footprint.
+    z = corners_cam[:, 2]
     uv = (corners_cam[:, :2] / z.unsqueeze(-1)) @ K[:2, :2].T + K[:2, 2]
     u = uv[:, 0].clamp(0, img_w)
     v = uv[:, 1].clamp(0, img_h)

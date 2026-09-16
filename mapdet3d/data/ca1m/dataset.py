@@ -1,95 +1,117 @@
-"""Sliding-window training sample generator over the real CA-1M dataset,
-wrapping Apple's `CubifyAnythingDataset` (vendored at
-`third_party/ml-cubifyanything`) rather than re-parsing its WebDataset tar
-format from scratch (see the plan's data-pipeline component notes).
+"""Chronological, capture-sharded CA-1M RGB windows from local tar archives.
 
-`CubifyAnythingDataset` streams per-timestamp samples (potentially
-interleaving multiple video captures depending on shard ordering), not
-pre-grouped sliding windows, so this module buffers frames per video_id and
-emits a T-frame training window each time a video's buffer has enough
-frames -- mirroring the paper's causal sliding-window training setup
-(Sec. 3.5): the window's LAST frame is always the one currently supervised.
+Reads only RGB, intrinsics, registered poses and annotations. In particular this
+avoids the pinned upstream reader's undefined empty_box/box_type empty branch
+and its unnecessary depth decoding. gt/RT is the registered camera-to-world pose.
 """
-
 from __future__ import annotations
-
-import random
-import sys
+import io
+import json
+import tarfile
 from pathlib import Path
+from collections import deque
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import IterableDataset, get_worker_info
+from mapdet3d.data.ca1m.annotations import project_corners_to_2d_box
+from mapdet3d.utils.geometry import corners_from_box
 
-from torch.utils.data import IterableDataset
 
-from mapdet3d.data.ca1m.annotations import instances_to_target
+def resolve_sources(source):
+    if isinstance(source, (list, tuple)):
+        paths = [str(p) for p in source]
+    else:
+        p = Path(source)
+        if p.is_dir():
+            paths = [str(x) for x in sorted(p.glob('*.tar'))]
+        elif p.suffix == '.txt':
+            paths = [str(p.parent / line.strip()) if not Path(line.strip()).is_absolute() and '://' not in line else line.strip()
+                     for line in p.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#')]
+        else:
+            paths = [str(p)]
+    if not paths:
+        raise FileNotFoundError(f'No CA-1M tar archives found in {source}')
+    for path in paths:
+        if '://' in path or not Path(path).is_file():
+            raise FileNotFoundError(f'CA-1M archive is not local: {path}. Download the capture tar files first; see README.')
+    return paths
 
-_TOOLKIT_ROOT = Path(__file__).resolve().parents[3] / "third_party" / "ml-cubifyanything"
-if str(_TOOLKIT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_TOOLKIT_ROOT))
+
+def decode_annotations(items, intrinsics, width, height):
+    center = torch.tensor([b['position'] for b in items], dtype=torch.float32).reshape(-1,3)
+    dims = torch.tensor([b['scale'] for b in items], dtype=torch.float32).reshape(-1,3)
+    rot = torch.tensor([b['R'] for b in items], dtype=torch.float32).reshape(-1,3,3)
+    corners = corners_from_box(center,dims,rot)
+    boxes = torch.stack([project_corners_to_2d_box(c,intrinsics,width,height) for c in corners]) if len(items) else torch.empty(0,4)
+    return dict(center=center,dims=dims,rot=rot,boxes2d=boxes)
+
+
+def read_capture(path):
+    with tarfile.open(path, 'r:*') as archive:
+        groups = {}
+        for member in archive.getmembers():
+            if not member.isfile() or '.' not in member.name:
+                continue
+            key, suffix = member.name.split('.',1)
+            video, stamp = key.rsplit('/',1)
+            if stamp == 'world':
+                continue
+            try:
+                timestamp = int(stamp)
+            except ValueError:
+                continue
+            groups.setdefault((video,timestamp), {})[suffix.lower().rsplit('.',1)[0]] = member
+        for (video,stamp), members in sorted(groups.items(),key=lambda item:(item[0][0],item[0][1])):
+            if 'wide/image' not in members:
+                continue
+            def read(key):
+                return archive.extractfile(members[key]).read()
+            image = np.array(Image.open(io.BytesIO(read('wide/image'))).convert('RGB'))
+            K = torch.tensor(json.loads(read('wide/image/k')),dtype=torch.float32).reshape(3,3)
+            target = decode_annotations(json.loads(read('wide/instances')),K,image.shape[1],image.shape[0])
+            view = dict(img=image,intrinsics=K,scene_id=video,timestamp=stamp/1e9,frame_id=str(stamp))
+            if 'gt/rt' in members:
+                pose = torch.tensor(json.loads(read('gt/rt')),dtype=torch.float32).reshape(4,4)
+                if not torch.isfinite(pose).all():
+                    raise ValueError(f'Nonfinite pose in {path}: {stamp}')
+                view['camera_poses'] = pose
+            yield dict(view=view,target=target)
 
 
 class CA1MWindowDataset(IterableDataset):
-    def __init__(
-        self,
-        source: str | list[str],
-        window_size: int = 5,
-        stride_range: tuple[int, int] = (2, 10),
-        max_buffer_per_video: int = 64,
-    ):
-        """
-        Args:
-            source: a tar path/URI, list of tar paths/URIs, or a `.txt`
-                link-list file (e.g. `data/train.txt` from the CA-1M repo),
-                passed straight through to `CubifyAnythingDataset`.
-            window_size: T, the number of views per training sample.
-            stride_range: (min, max) frame stride sampled per window,
-                matching the paper's randomized 2-10 FPS sampling augmentation.
-            max_buffer_per_video: bounds per-video memory use; older frames
-                are dropped once a video's buffer exceeds this size.
-        """
-        self.source = source
-        self.window_size = window_size
-        self.stride_range = stride_range
+    def __init__(self, source, window_size=5, max_buffer_per_video=256,
+                 fps_range=(2,10), rank=0, world_size=1):
+        super().__init__()
+        if window_size < 1 or fps_range[0] <= 0 or fps_range[1] < fps_range[0]:
+            raise ValueError('Invalid window size or FPS range')
+        self.source, self.window_size = source,window_size
         self.max_buffer_per_video = max_buffer_per_video
+        self.fps_range = fps_range
+        self.rank,self.world_size = rank,world_size
 
-    def _underlying(self):
-        from cubifyanything.dataset import CubifyAnythingDataset
-
-        return CubifyAnythingDataset(self.source, load_arkit_depth=False)
+    def iter_frames(self):
+        paths = resolve_sources(self.source)
+        worker = get_worker_info()
+        nworkers = worker.num_workers if worker else 1
+        wid = worker.id if worker else 0
+        # Whole captures belong to exactly one worker/rank.
+        worker_id = self.rank*nworkers+wid
+        for path in paths[worker_id::self.world_size*nworkers]:
+            yield from read_capture(path)
 
     def __iter__(self):
-        buffers: dict[int, list] = {}
-        for sample in self._underlying():
-            if "wide" not in sample:
-                continue  # skip timeless "world" instance samples
-
-            video_id = sample["meta"]["video_id"]
-            buf = buffers.setdefault(video_id, [])
-            buf.append(sample)
-            if len(buf) > self.max_buffer_per_video:
-                buf.pop(0)
-
-            if len(buf) < self.window_size:
-                continue
-
-            stride = random.randint(*self.stride_range)
-            start = len(buf) - 1 - (self.window_size - 1) * stride
-            if start < 0:
-                stride = 1
-                start = len(buf) - self.window_size
-
-            indices = list(range(start, len(buf), stride))[-self.window_size :]
-            yield self._build_sample([buf[i] for i in indices])
-
-    def _build_sample(self, window: list[dict]) -> dict:
-        views = []
-        for s in window:
-            img_chw = s["wide"]["image"][0]  # (C, H, W) uint8
-            img_hwc = img_chw.permute(1, 2, 0).numpy()
-            K = s["sensor_info"].wide.image.K[0]  # (3, 3)
-            views.append({"img": img_hwc, "intrinsics": K})
-
-        last_sample = window[-1]
-        last_K = last_sample["sensor_info"].wide.image.K[0]
-        img_h, img_w = last_sample["wide"]["image"].shape[-2:]
-        target = instances_to_target(last_sample["wide"]["instances"], last_K, img_w, img_h)
-
-        return {"views": views, "target": target}
+        buffer = deque(maxlen=self.max_buffer_per_video)
+        scene = None
+        for frame in self.iter_frames():
+            view = frame['view']
+            if view['scene_id'] != scene:
+                buffer.clear()
+                scene = view['scene_id']
+            if buffer and view['timestamp'] <= buffer[-1]['view']['timestamp']:
+                raise ValueError(f'Non-increasing timestamps for capture {scene}')
+            buffer.append(frame)
+            duration = (self.window_size-1)/self.fps_range[0]
+            while len(buffer)>1 and buffer[1]['view']['timestamp'] < view['timestamp']-duration:
+                buffer.popleft()
+            yield {'history':list(buffer)}

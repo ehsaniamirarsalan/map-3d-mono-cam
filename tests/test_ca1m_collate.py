@@ -24,7 +24,7 @@ def _make_sample(window_size: int, img_hw=(64, 48), num_boxes: int = 1) -> dict:
         "dims": torch.rand(num_boxes, 3) + 0.5,
         "rot": torch.eye(3).unsqueeze(0).expand(num_boxes, 3, 3).clone(),
     }
-    return {"views": views, "target": target}
+    return {"views": views, "targets": [{k:v.clone() for k,v in target.items()} for _ in range(window_size)]}
 
 
 def test_collate_produces_batched_views_and_unbatched_targets():
@@ -39,10 +39,10 @@ def test_collate_produces_batched_views_and_unbatched_targets():
         assert view["img"].ndim == 4  # (B, C, H, W)
         assert view["intrinsics"].shape == (batch_size, 3, 3)
 
-    assert len(targets) == batch_size
+    assert len(targets) == batch_size * window_size
 
 
 def test_collate_rejects_mismatched_window_sizes():
     batch = [_make_sample(4), _make_sample(5)]
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         collate_ca1m_batch(batch)

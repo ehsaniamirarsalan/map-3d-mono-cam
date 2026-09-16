@@ -13,4 +13,5 @@ class Track:
     center: Tensor  # (3,) world coordinates
     dims: Tensor  # (3,)
     rot: Tensor  # (3, 3) world-frame rotation
+    score: float = 0.0
     age: int = 0

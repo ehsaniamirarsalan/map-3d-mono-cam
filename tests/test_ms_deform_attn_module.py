@@ -26,15 +26,13 @@ def test_output_shape_and_gradient_flow():
         assert p.grad is not None, f"no gradient reached {name}"
 
 
-def test_zero_initialized_offsets_and_uniform_weights_at_init():
-    # sampling_offsets/attention_weights are zero-initialized (matching the
-    # standard Deformable DETR init scheme), so at initialization every
-    # query samples exactly at its own reference point with uniform weights
-    # across levels/points -- a useful, checkable starting-point invariant.
+def test_radial_offsets_and_uniform_weights_at_init():
     attn = MSDeformAttn(d_model=8, n_levels=2, n_heads=2, n_points=2)
     query = torch.zeros(1, 1, 8)
     offsets = attn.sampling_offsets(query)
     weights_logits = attn.attention_weights(query)
-    assert torch.allclose(offsets, torch.zeros_like(offsets))
+    radial = offsets.view(1,1,2,2,2,2)
+    assert torch.allclose(radial[...,1,:],2*radial[...,0,:])
+    assert (radial.abs().sum(-1)>0).all()
     weights = torch.softmax(weights_logits.view(1, 1, 2, 2 * 2), dim=-1)
     assert torch.allclose(weights, torch.full_like(weights, 1.0 / 4.0))

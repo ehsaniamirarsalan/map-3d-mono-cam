@@ -93,6 +93,14 @@ class MapDet3D(nn.Module):
         self.core = core
 
     def forward(self, views: list[dict]) -> dict[str, Tensor | list]:
+        config = getattr(self, 'config', {})
+        views = [dict(v) for v in views]
+        for view in views:
+            if not config.get('use_intrinsics', True):
+                view.pop('intrinsics', None)
+            if not config.get('use_poses', True):
+                view.pop('camera_poses', None)
+                view.pop('is_metric_scale', None)
         backbone_out = self.backbone(views)
         num_views = len(views)
 

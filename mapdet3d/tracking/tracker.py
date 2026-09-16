@@ -16,10 +16,14 @@ from mapdet3d.utils.geometry import box_volume
 
 
 class Tracker:
-    def __init__(self, iou_threshold: float = 0.1, num_samples_iou: int = 5000):
+    def __init__(self, iou_threshold: float = 0.25, num_samples_iou: int = 5000):
         self.iou_threshold = iou_threshold
         self.num_samples_iou = num_samples_iou
         self.tracks: list[Track] = []
+        self._next_id = 0
+
+    def reset(self):
+        self.tracks.clear()
         self._next_id = 0
 
     def step(
@@ -28,6 +32,7 @@ class Tracker:
         det_dims: Tensor,
         det_rots_cam: Tensor,
         pose_cam2world: Tensor,
+        scores: Tensor | None = None,
     ) -> list[Track]:
         """
         Args:
@@ -39,6 +44,10 @@ class Tracker:
         Returns:
             The updated list of all tracks (including newly created ones).
         """
+        if scores is None:
+            scores = det_dims.new_ones(len(det_dims))
+        if len(scores) != len(det_dims):
+            raise ValueError("One score is required per detection")
         det_centers, det_rots = transform_to_world(det_centers_cam, det_rots_cam, pose_cam2world)
         num_dets = det_centers.shape[0]
 
@@ -47,9 +56,9 @@ class Tracker:
             track_dims = torch.stack([t.dims for t in self.tracks])
             track_rots = torch.stack([t.rot for t in self.tracks])
         else:
-            track_centers = torch.zeros(0, 3)
-            track_dims = torch.zeros(0, 3)
-            track_rots = torch.zeros(0, 3, 3)
+            track_centers = det_centers.new_zeros(0, 3)
+            track_dims = det_centers.new_zeros(0, 3)
+            track_rots = det_rots.new_zeros(0, 3, 3)
 
         affinity = compute_affinity(
             track_centers, track_dims, track_rots, det_centers, det_dims, det_rots,
@@ -71,22 +80,23 @@ class Tracker:
                     break
                 matched_tracks.add(t_idx)
                 matched_dets.add(d_idx)
-                self._update_track(t_idx, det_centers[d_idx], det_dims[d_idx], det_rots[d_idx])
+                self._update_track(t_idx, det_centers[d_idx], det_dims[d_idx], det_rots[d_idx], float(scores[d_idx]))
 
         for d_idx in range(num_dets):
             if d_idx not in matched_dets:
-                self._create_track(det_centers[d_idx], det_dims[d_idx], det_rots[d_idx])
+                self._create_track(det_centers[d_idx], det_dims[d_idx], det_rots[d_idx], float(scores[d_idx]))
 
         for track in self.tracks:
             track.age += 1
 
         return self.tracks
 
-    def _update_track(self, track_idx: int, center: Tensor, dims: Tensor, rot: Tensor) -> None:
+    def _update_track(self, track_idx: int, center: Tensor, dims: Tensor, rot: Tensor, score: float = 1.0) -> None:
         track = self.tracks[track_idx]
         if box_volume(dims) > box_volume(track.dims):
             track.center, track.dims, track.rot = center, dims, rot
+            track.score = score
 
-    def _create_track(self, center: Tensor, dims: Tensor, rot: Tensor) -> None:
-        self.tracks.append(Track(id=self._next_id, center=center, dims=dims, rot=rot))
+    def _create_track(self, center: Tensor, dims: Tensor, rot: Tensor, score: float = 1.0) -> None:
+        self.tracks.append(Track(id=self._next_id, center=center, dims=dims, rot=rot, score=score))
         self._next_id += 1

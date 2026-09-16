@@ -44,7 +44,7 @@ def compute_affinity(
     num_dets); empty (0-sized) inputs produce an appropriately empty matrix.
     """
     if track_centers.shape[0] == 0 or det_centers.shape[0] == 0:
-        return torch.zeros(track_centers.shape[0], det_centers.shape[0])
+        return det_centers.new_zeros(track_centers.shape[0], det_centers.shape[0])
     return box3d_iou_montecarlo(
         track_centers, track_dims, track_rots, det_centers, det_dims, det_rots, num_samples=num_samples
     )

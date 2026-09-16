@@ -32,7 +32,7 @@ def _greedy_match(
     else:
         all_scores = torch.zeros(0)
 
-    order = torch.argsort(all_scores, descending=True)
+    order = torch.argsort(all_scores, descending=True, stable=True)
 
     # Precompute per-frame IoU matrices and a "matched" flag per GT box.
     iou_matrices = []
@@ -106,6 +106,10 @@ def compute_ap_ar(
     Returns:
         {"AP": float, "AR": float}
     """
+    if len(frame_preds) != len(frame_gts):
+        raise ValueError("Prediction and ground-truth frame counts differ")
+    frame_preds = [{k: v.detach().cpu() for k,v in p.items()} for p in frame_preds]
+    frame_gts = [{k: v.detach().cpu() for k,v in p.items()} for p in frame_gts]
     tp, fp, total_gt = _greedy_match(frame_preds, frame_gts, iou_threshold, num_samples)
 
     if total_gt == 0:
